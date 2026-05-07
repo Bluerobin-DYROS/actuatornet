@@ -9,11 +9,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from utils import JOINT_GROUPS, load_single_experiment
+from utils import JOINT_GROUPS, LSTM_WARMUP_LEN, load_single_experiment
 
 # ── Configuration ────────────────────────────────────────────────────────────
-EXPERIMENT_DIR = '/home/user/actuatornet/actuator_net/data/pkl'
-MODEL_DIR      = '/home/user/actuatornet/actuator_net'
+_HERE          = os.path.dirname(os.path.abspath(__file__))
+EXPERIMENT_DIR = os.path.join(_HERE, 'data', 'pkl')
+MODEL_DIR      = _HERE
 
 # Choose a pkl file that was NOT used during training.
 # Disturbance datasets are new and were never included in training.
@@ -55,23 +56,30 @@ for idx, (joint_indices, group_name) in enumerate(JOINT_GROUPS):
 
     ji = joint_indices[0]
 
-    xs = torch.stack([jpe[:, ji], jv[:, ji]], dim=1).unsqueeze(1)  # (N, 1, 2)
+    # Shape (1, N, 2): one batch, full trajectory as the sequence dim, so the
+    # LSTM carries hidden state across all N timesteps from a single h=0 init.
+    # Using (N, 1, 2) instead would reset h, c every step → predictions become
+    # context-free and RMSE blows up.
+    xs = torch.stack([jpe[:, ji], jv[:, ji]], dim=1).unsqueeze(0)  # (1, N, 2)
 
     with torch.no_grad():
-        y_pred_scaled, _ = model(xs)   # (N, 1)
+        y_pred_scaled, _ = model(xs)   # (1, N, 1)
 
-    y_pred_scaled = y_pred_scaled[:, 0]  # (N,)
-    y_true_scaled = te[:, ji]            # (N,)
+    y_pred_scaled = y_pred_scaled[0, :, 0]  # (N,)
+    y_true_scaled = te[:, ji]               # (N,)
 
     # Convert to Nm
     y_pred_Nm = y_pred_scaled / TORQUE_SCALE
     y_true_Nm = y_true_scaled / TORQUE_SCALE
 
-    rmse = float(torch.sqrt(((y_pred_Nm - y_true_Nm) ** 2).mean()))
-    print(f"RMSE={rmse:.4f} Nm")
+    # Skip the first LSTM_WARMUP_LEN steps: hidden state is still building
+    # up from h=0 there, and training does not score that region either.
+    diff = y_pred_Nm[LSTM_WARMUP_LEN:] - y_true_Nm[LSTM_WARMUP_LEN:]
+    rmse = float(torch.sqrt((diff ** 2).mean()))
+    print(f"[{group_name:22s}]  RMSE={rmse:.4f} Nm  (skipped first {LSTM_WARMUP_LEN} steps)")
     results[group_name] = {"rmse": rmse}
 
-    t_axis = np.arange(N) * 0.001  # 1 kHz → seconds
+    t_axis = np.arange(N) * 0.005  # 200 Hz → seconds
     ax.plot(t_axis, y_true_Nm.numpy(), label="Measured",   color="green", linewidth=1.5)
     ax.plot(t_axis, y_pred_Nm.numpy(), label="LSTM pred",  color="red",   linewidth=0.8, linestyle="--")
     ax.set_title(f"{group_name}  RMSE={rmse:.3f} Nm", fontsize=8)

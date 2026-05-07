@@ -11,13 +11,15 @@ import matplotlib.pyplot as plt
 import datetime
 
 from utils import (
-    JOINT_GROUPS, EVAL_PKL_NAME,
+    JOINT_GROUPS, EVAL_PKL_NAME, LSTM_WARMUP_LEN,
     load_single_experiment, prepare_data_for_joint_group,
+    prepare_data_for_lstm_eval,
 )
 
-EXPERIMENT_DIR    = '/home/dyros/scraps/actuator_net/data/pkl'
-ACTUATOR_NET_PATH = '/home/dyros/scraps/actuator_net/p73_lstm.pt'
-BEST_PARAMS_PATH  = 'best_params.json'
+_HERE = os.path.dirname(os.path.abspath(__file__))
+EXPERIMENT_DIR    = os.path.join(_HERE, 'data', 'pkl')
+ACTUATOR_NET_PATH = os.path.join(_HERE, 'p73_lstm.pt')
+BEST_PARAMS_PATH  = os.path.join(_HERE, 'best_params.json')
 DEVICE            = 'cpu'
 MODEL_TYPE        = 'lstm'
 eval_pkl_path = os.path.join(EXPERIMENT_DIR, EVAL_PKL_NAME)
@@ -60,19 +62,33 @@ for idx, (joint_indices, group_name) in enumerate(JOINT_GROUPS):
     model = torch.jit.load(group_net_path, map_location=DEVICE)
     model.eval()
 
-    xs, ys = prepare_data_for_joint_group(jpe, jv, te, joint_indices, params['num_samples_in_history'], model_type=MODEL_TYPE)
+    if MODEL_TYPE == 'lstm':
+        # Run the whole trajectory as one sequence so hidden state is carried
+        # across all timesteps from h=0, mirroring real-time inference.
+        xs, ys = prepare_data_for_lstm_eval(jpe, jv, te, joint_indices)  # (1, T, 2*n), (1, T, n)
+        with torch.no_grad():
+            y_pred, _ = model(xs)                         # (1, T, n)
+        # Drop warm-up region for metrics (matches training: those steps
+        # are where hidden state is still building up from zero).
+        diff = y_pred[:, LSTM_WARMUP_LEN:] - ys[:, LSTM_WARMUP_LEN:]
+        loss = (diff ** 2).mean().item()
+        mae  = diff.abs().mean().item()
+        ys_plot     = ys[0, LSTM_WARMUP_LEN:, 0].numpy()
+        y_pred_plot = y_pred[0, LSTM_WARMUP_LEN:, 0].numpy()
+    else:
+        xs, ys = prepare_data_for_joint_group(jpe, jv, te, joint_indices, params['num_samples_in_history'], model_type=MODEL_TYPE)
+        with torch.no_grad():
+            y_pred = model(xs)
+        loss = ((y_pred - ys) ** 2).mean().item()
+        mae  = (y_pred - ys).abs().mean().item()
+        ys_plot     = ys[:, 0].numpy()
+        y_pred_plot = y_pred[:, 0].numpy()
 
-    with torch.no_grad():
-        # xs: (N, seq_len, 2) – already windowed, pass directly
-        y_pred, _ = model(xs)
-
-    loss = ((y_pred - ys) ** 2).mean().item()
-    mae  = (y_pred - ys).abs().mean().item()
     print(f"[{group_name}]  MSE={loss:.6f}  MAE={mae:.6f}")
     results[group_name] = {"mse": loss, "mae": mae}
 
-    ax.plot(ys[:, 0].numpy(),     label="Measured",  color="green", linewidth=1.5)
-    ax.plot(y_pred[:, 0].numpy(), label="Predicted", color="red",   linewidth=0.6)
+    ax.plot(ys_plot,     label="Measured",  color="green", linewidth=1.5)
+    ax.plot(y_pred_plot, label="Predicted", color="red",   linewidth=0.6)
     ax.set_title(f"{group_name}  MSE={loss:.4f}  MAE={mae:.4f}", fontsize=8)
     ax.set_ylabel("Torque (scaled)", fontsize=7)
     ax.legend(fontsize=6)

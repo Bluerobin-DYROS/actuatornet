@@ -15,9 +15,10 @@ from utils import (
     load_single_experiment, prepare_data_for_joint_group,
 )
 
-EXPERIMENT_DIR    = '/home/dyros/scraps/actuator_net/data/pkl'
-ACTUATOR_NET_PATH = '/home/dyros/scraps/p73.pt'
-BEST_PARAMS_PATH  = 'best_params.json'
+_HERE = os.path.dirname(os.path.abspath(__file__))
+EXPERIMENT_DIR    = os.path.join(_HERE, 'data', 'pkl')
+ACTUATOR_NET_PATH = os.path.join(_HERE, 'p73.pt')
+BEST_PARAMS_PATH  = os.path.join(_HERE, 'best_params.json')
 DEVICE            = 'cpu'
 
 eval_pkl_path = os.path.join(EXPERIMENT_DIR, EVAL_PKL_NAME)

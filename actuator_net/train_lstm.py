@@ -1,6 +1,7 @@
+import os
 from utils import train_actuator_network_and_plot_predictions
 
-EXPERIMENT_DIR     = '/home/dyros/scraps/actuator_net/data/pkl'
+EXPERIMENT_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'pkl')
 ACTUATOR_NET_PATH  = 'p73_lstm.pt'
 DATALOADER_PATH    = 'p73_lstm.dataloader'
 MODEL_TYPE         = 'lstm'

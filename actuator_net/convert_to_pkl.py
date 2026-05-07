@@ -19,10 +19,14 @@ joint_positions[1:13] are the 12 actual joints in user-specified order.
 import pickle
 import numpy as np
 from pathlib import Path
+from scipy.signal import decimate
 
 DATA_ROOT = Path(__file__).parent / "data"
 OUTPUT_DIR = DATA_ROOT / "pkl"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Raw logs are 1 kHz; decimate 5× to 200 Hz for LSTM training/inference.
+DECIMATION_FACTOR = 5
 
 JOINT_NAMES = [
     "platform",
@@ -41,15 +45,36 @@ JOINT_NAMES = [
 ]
 
 
-def convert_experiment(exp_dir: Path, dt: float = 0.001):
-    """Load txt logs from one experiment and return a list of timestep dicts."""
+def _decimate(arr: np.ndarray, factor: int, has_timestamp: bool) -> np.ndarray:
+    """Anti-aliased decimation along axis 0. If has_timestamp, col 0 is
+    pure-subsampled (no filter) so timestamps remain monotonic."""
+    if has_timestamp:
+        ts   = arr[::factor, 0:1]
+        body = decimate(arr[:, 1:], factor, axis=0, ftype='iir', zero_phase=True)
+        n = min(ts.shape[0], body.shape[0])
+        return np.hstack([ts[:n], body[:n]])
+    return decimate(arr, factor, axis=0, ftype='iir', zero_phase=True)
+
+
+def convert_experiment(exp_dir: Path, dt: float = 0.005):
+    """Load txt logs from one experiment and return a list of timestep dicts.
+
+    Raw logs are 1 kHz; decimated by DECIMATION_FACTOR (default 5) so the
+    output pkl is at 200 Hz.
+    """
     pos = np.loadtxt(exp_dir / "joint_position_log.txt")
     vel = np.loadtxt(exp_dir / "joint_velocity_log.txt")
     des = np.loadtxt(exp_dir / "joint_desired_log.txt")
     trq = np.loadtxt(exp_dir / "torque_joint_log.txt")
 
+    has_ts = pos.shape[1] == 14
+    pos = _decimate(pos, DECIMATION_FACTOR, has_ts)
+    vel = _decimate(vel, DECIMATION_FACTOR, has_ts)
+    des = _decimate(des, DECIMATION_FACTOR, has_ts)
+    trq = _decimate(trq, DECIMATION_FACTOR, has_ts)
+
     # Auto-detect: 14-col files have a timestamp in col 0; 13-col files do not
-    if pos.shape[1] == 14:
+    if has_ts:
         # col 0 = timestamp, cols 1-12 = 12 joints, col 13 = misc/platform
         timestamps   = pos[:, 0]
         pos_data     = pos[:, 1:13]
@@ -89,7 +114,7 @@ def convert_experiment(exp_dir: Path, dt: float = 0.001):
     return records
 
 
-def convert_directory(data_dir: Path, dt: float = 0.001):
+def convert_directory(data_dir: Path, dt: float = 0.005):
     for exp_dir in sorted(data_dir.iterdir()):
         if not exp_dir.is_dir():
             continue
@@ -101,10 +126,13 @@ def convert_directory(data_dir: Path, dt: float = 0.001):
         print(f"{len(records)} steps → {out_path.name}")
 
 
-print("Converting actuatornet experiments...")
+print("Converting actuatornet experiments (200 Hz after 5x decimation)...")
 convert_directory(DATA_ROOT / "actuatornet")
 
-print("Converting pace experiments (dt=0.001 s)...")
-convert_directory(DATA_ROOT / "pace", dt=0.001)
+print("Converting pace experiments (dt=0.005 s, 200 Hz after 5x decimation)...")
+convert_directory(DATA_ROOT / "pace", dt=0.005)
+
+print("Converting jo experiments (dt=0.005 s, 200 Hz after 5x decimation)...")
+convert_directory(DATA_ROOT / "jo", dt=0.005)
 
 print(f"\nDone. PKL files saved to: {OUTPUT_DIR}")

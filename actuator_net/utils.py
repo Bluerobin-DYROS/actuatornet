@@ -99,7 +99,7 @@ class LSTMModel(nn.Module):
             c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
             state = (h0, c0)
         out, (h, c) = self.lstm(x, state)
-        out = self.fc(out[:, -1, :])
+        out = self.fc(out)
         return out, (h, c)
 
 def build_lstm(in_dim, units, layers, out_dim):
@@ -176,17 +176,32 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
         ct = 0
         for batch in train_loader:
             data = batch['joint_states'].to(device)
+            y_label = batch['tau_ests'].to(device)
             if model_type == 'lstm':
                 y_pred, _ = model(data)
+                # Drop warm-up region: first LSTM_WARMUP_LEN steps each window
+                # are where hidden state is still building up from h=0.
+                loss = ((y_pred[:, LSTM_WARMUP_LEN:] - y_label[:, LSTM_WARMUP_LEN:]) ** 2).mean()
             else:
                 y_pred = model(data)
+                loss = ((y_pred - y_label) ** 2).mean()
+            # Skip the whole batch if loss is non-finite — clip_grad_norm_
+            # does NOT protect against NaN: it rescales by max_norm/total_norm,
+            # and if any grad component is NaN total_norm is NaN, so all grads
+            # become NaN after clipping and weights get permanently poisoned.
+            if not torch.isfinite(loss):
+                print(f"  [warn] non-finite loss at epoch {epoch}, skipping batch")
+                opt.zero_grad()
+                continue
             opt.zero_grad()
-            y_label = batch['tau_ests'].to(device)
-            loss = ((y_pred - y_label) ** 2).mean()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             epoch_loss += loss.detach().cpu().numpy()
             ct += 1
+        if ct == 0:
+            print(f"  [warn] all batches at epoch {epoch} had non-finite loss")
+            continue
         epoch_loss /= ct
 
         test_loss = 0
@@ -195,17 +210,18 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
         with torch.no_grad():
             for batch in test_loader:
                 data = batch['joint_states'].to(device)
+                y_label = batch['tau_ests'].to(device)
                 if model_type == 'lstm':
                     y_pred, _ = model(data)
+                    diff = y_pred[:, LSTM_WARMUP_LEN:] - y_label[:, LSTM_WARMUP_LEN:]
                 else:
                     y_pred = model(data)
-                y_label = batch['tau_ests'].to(device)
-                tau_est_loss = ((y_pred - y_label) ** 2).mean()
-                loss = tau_est_loss
-                test_mae = (y_pred - y_label).abs().mean()
+                    diff = y_pred - y_label
+                tau_est_loss = (diff ** 2).mean()
+                test_mae     = diff.abs().mean()
 
-                test_loss += loss
-                mae += test_mae
+                test_loss += tau_est_loss
+                mae       += test_mae
                 ct += 1
             test_loss /= ct
             mae /= ct
@@ -218,8 +234,14 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
 
         print(f'epoch: {epoch} | loss: {epoch_loss:.4f} | test loss: {test_loss:.4f} | mae: {mae:.4f}')
 
-        model_scripted = torch.jit.script(model)  # Export to TorchScript
-        model_scripted.save(actuator_network_path)  # Save
+        # Only checkpoint if the model weights are finite — otherwise a single
+        # bad batch gets persisted and warm-start poisons every later pkl.
+        all_finite = all(torch.isfinite(p).all() for p in model.parameters())
+        if all_finite:
+            model_scripted = torch.jit.script(model)  # Export to TorchScript
+            model_scripted.save(actuator_network_path)  # Save
+        else:
+            print(f"  [warn] non-finite weights detected, skipping checkpoint save")
         
     metrics['test_loss'] = test_loss
     metrics['mae'] = mae
@@ -351,6 +373,14 @@ def prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, nu
 # Data is recorded at 0.001 s; history samples are spaced 0.01 s apart → stride of 10 steps.
 HISTORY_STRIDE = 10
 
+# LSTM windowed training: each training sample is a length-LSTM_WINDOW_LEN
+# sub-sequence. The first LSTM_WARMUP_LEN steps are excluded from the loss so
+# the LSTM can build up hidden state from h=0 before being scored. Windows are
+# emitted with stride LSTM_WINDOW_STRIDE to control compute.
+LSTM_WINDOW_LEN    = 50
+LSTM_WARMUP_LEN    = 10
+LSTM_WINDOW_STRIDE = 10
+
 def prepare_data_for_joint_group(joint_position_errors, joint_velocities, tau_ests, joint_indices, num_samples_in_history, history_stride=HISTORY_STRIDE, model_type="lstm"):
     """Like prepare_data_for_model but for a specific group of joints (single or coupled).
 
@@ -376,18 +406,58 @@ def prepare_data_for_joint_group(joint_position_errors, joint_velocities, tau_es
                 xs_parts.append(joint_velocities[start:end, i:i+1])
         xs = torch.cat(xs_parts, dim=1)
     else:
+        # LSTM: emit length-L sliding windows so the network learns to use a
+        # carried hidden state. Each sample is (L, 2*n) features and (L, n)
+        # targets; loss is masked out for the first LSTM_WARMUP_LEN steps in
+        # the train loop.
+        feats_parts = []
         for i in joint_indices:
-            xs_parts.append(joint_position_errors[:, i:i+1])
-            xs_parts.append(joint_velocities[:, i:i+1])
-        xs = torch.cat(xs_parts, dim=1).unsqueeze(1)
-        ys = tau_ests[:, joint_indices]         # (N, num_joints)
+            feats_parts.append(joint_position_errors[:, i:i+1])
+            feats_parts.append(joint_velocities[:, i:i+1])
+        feats   = torch.cat(feats_parts, dim=1)   # (T, 2*n)
+        targets = tau_ests[:, joint_indices]      # (T, n)
+
+        T = feats.shape[0]
+        L = LSTM_WINDOW_LEN
+        if T < L:
+            raise ValueError(f"Trajectory too short for LSTM windowing: T={T} < L={L}")
+
+        starts  = range(0, T - L + 1, LSTM_WINDOW_STRIDE)
+        xs_list = [feats[s:s + L]   for s in starts]
+        ys_list = [targets[s:s + L] for s in starts]
+        xs = torch.stack(xs_list, dim=0)  # (N, L, 2*n)
+        ys = torch.stack(ys_list, dim=0)  # (N, L, n)
         return xs, ys
+
+
+def prepare_data_for_lstm_eval(joint_position_errors, joint_velocities, tau_ests, joint_indices):
+    """Build a single (1, T, 2*n) input + (1, T, n) target for full-trajectory
+    LSTM evaluation. Hidden state is carried across all T steps from h=0;
+    callers should ignore the first LSTM_WARMUP_LEN predictions when reporting
+    metrics, since training does not score that warm-up region.
+    """
+    feats_parts = []
+    for i in joint_indices:
+        feats_parts.append(joint_position_errors[:, i:i+1])
+        feats_parts.append(joint_velocities[:, i:i+1])
+    feats   = torch.cat(feats_parts, dim=1).unsqueeze(0)   # (1, T, 2*n)
+    targets = tau_ests[:, joint_indices].unsqueeze(0)      # (1, T, n)
+    return feats, targets
 
 def train_actuator_network_and_plot_predictions(experiment_dir, actuator_network_path, dataloader_path, model_type, load_pretrained_model=False):
     hyperparam_sweep = False
     best_params_path = os.path.join(os.path.dirname(actuator_network_path) or ".", "best_params.json")
     all_pkl_files = [f for f in sorted(glob(f"{experiment_dir}/*.pkl"))
                      if os.path.basename(f) != EVAL_PKL_NAME]
+    # jo data first, then pace/actuatornet — sequential continual training is
+    # order-sensitive (last pkl has the largest influence on final weights),
+    # so this lets the cleaner pace/actuatornet data anchor the final model.
+    jo_files     = [f for f in all_pkl_files if os.path.basename(f).startswith("jo_")]
+    other_files  = [f for f in all_pkl_files if not os.path.basename(f).startswith("jo_")]
+    all_pkl_files = jo_files + other_files
+    print("PKL training order:")
+    for f in all_pkl_files:
+        print(f"  {os.path.basename(f)}")
     num_samples_in_history = 2
 
     if load_pretrained_model:

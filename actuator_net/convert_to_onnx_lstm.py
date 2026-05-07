@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import os
 
-PT_DIR   = "/home/dyros/scraps/actuator_net"
-ONNX_DIR = "/home/dyros/ros2_ws/src/p73_walker_controller/p73_lib/src/actuatornet_models"
+_HERE    = os.path.dirname(os.path.abspath(__file__))
+PT_DIR   = _HERE
+ONNX_DIR = os.path.join(_HERE, "onnx")
+os.makedirs(ONNX_DIR, exist_ok=True)
 
 JOINT_NAMES = [
     "left_hip_roll",   "left_hip_pitch",   "left_hip_yaw",
@@ -64,6 +66,7 @@ for joint_name in JOINT_NAMES:
         input_names=["input", "h_in", "c_in"],
         output_names=["output", "h_out", "c_out"],
         opset_version=11,
+        dynamo=False,
     )
     print(f"Converted: p73_lstm_{joint_name}.onnx  "
           f"(hidden={hidden_size}, layers={num_layers})")
